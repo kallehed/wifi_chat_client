@@ -1,7 +1,8 @@
 use std::hash::{BuildHasher, Hasher};
 use std::io::{Error, Read, Write};
-use std::net::{IpAddr, UdpSocket, TcpListener, TcpStream, SocketAddr, SocketAddrV4};
-use std::sync::mpsc::SyncSender;
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const PORT: u16 = 2000;
@@ -58,11 +59,9 @@ fn listen_and_broadcast_existance(channel: SyncSender<Client>, name: &[u8]) -> R
     }
 }
 
-// listens on stdin for a number, which will correspond to a client to connect to
-fn stdin_listener(channel: SyncSender<u64>) -> Result<(), Error> {
+// listens on stdin and forwards it through channel
+fn stdin_listener(channel: SyncSender<String>) -> Result<(), Error> {
     loop {
-        let stdin = std::io::stdin();
-
         let mut buf = [0; 256];
         println!("waiting for stdin");
         let size = std::io::stdin().read(&mut buf)?;
@@ -71,91 +70,118 @@ fn stdin_listener(channel: SyncSender<u64>) -> Result<(), Error> {
         let Ok(str) = std::str::from_utf8(&buf[..size]) else {
             continue;
         };
-        let str = str.trim();
-        let Ok(num) = str.parse() else {
-            continue;
-        };
-        channel.send(num).unwrap();
+        channel.send(str.to_string()).unwrap();
     }
 }
 
-fn incoming_connection_listener() -> Result<(), Error> {
+fn incoming_connection_listener(stdin_receiver: &Mutex<Receiver<String>>) -> Result<(), Error> {
     let listener = TcpListener::bind(("0.0.0.0", PORT))?;
 
-    let (stream, _address) = listener.accept()?;
-    talk_with_client(stream)?;
+    loop {
+        let (stream, _address) = listener.accept()?;
+        talk_with_client(stream, stdin_receiver)?;
+    }
+}
 
+fn talk_with_client(
+    mut stream: TcpStream,
+    stdin_receiver: &Mutex<Receiver<String>>,
+) -> Result<(), Error> {
+    let stdin_receiver = stdin_receiver.lock().unwrap();
+    println!("CONNECTION CREATED!");
+    stream.set_read_timeout(Some(Duration::from_millis(10)))?;
+    'main_loop: loop {
+        'block: {
+            let Ok(input) = stdin_receiver.recv_timeout(Duration::from_millis(10)) else {
+                break 'block;
+            };
+            if input.trim() == "exit" || input.trim() == "quit" {
+                break 'main_loop;
+            }
+            stream.write_all(input.as_str().as_bytes())?;
+        }
+        'block: {
+            let mut buf = [0; 256];
+            let Ok(size) = stream.read(&mut buf) else {
+                break 'block;
+            };
+            if size == 0 {
+                // client has disconnected
+                break 'main_loop;
+            }
+            print!("got: ");
+            std::io::stdout().write_all(&buf[..size])?;
+        }
+    }
+    println!("DISCONNECTED!");
     Ok(())
 }
 
-fn talk_with_client(mut stream: TcpStream) -> Result<(), Error> {
-    println!("CONNECTION CREATED!");
-
-    loop {
-        let mut buf = [0; 256];
-
-        std::io::stdin().read(&mut buf)?;
-        stream.write_all(&buf)?;
-        println!("got: "); 
-        stream.read(&mut buf)?;
-        std::io::stdout().write_all(&buf)?;
-        stream.write_all(&buf)?;
-
-    }
-    
-    // Ok(())
-}
-
 fn main() -> Result<(), Error> {
-    let (client_sender, client_reciever) = std::sync::mpsc::sync_channel(0);
+    let (client_sender, client_receiver) = mpsc::sync_channel(0);
     let _listener = std::thread::spawn(move || {
         listen_and_broadcast_existance(client_sender, b"YOLOSwag").unwrap();
     });
 
-    let (stdin_sender, stdin_reciever) = std::sync::mpsc::sync_channel(0);
-    let _stdin_listener = std::thread::spawn(move || {
-        stdin_listener(stdin_sender).unwrap();
-    });
+    let (stdin_sender, stdin_receiver) = mpsc::sync_channel(0);
+    let stdin_receiver = Mutex::new(stdin_receiver);
+    std::thread::scope(|s| -> Result<(), Error> {
+        let _stdin_listener = s.spawn(move || {
+            stdin_listener(stdin_sender).unwrap();
+        });
 
-    let _connection_listener = std::thread::spawn(move || {
-        incoming_connection_listener().unwrap();
-    });
+        let _connection_listener = s.spawn(|| {
+            incoming_connection_listener(&stdin_receiver).unwrap();
+        });
 
-    let mut clients = std::collections::HashSet::new();
+        let mut clients = std::collections::HashSet::new();
 
-    loop {
-        'block: {
-            let Ok(client) = client_reciever.recv_timeout(Duration::from_millis(10)) else {
-                break 'block;
-            };
-            //println!("found {}", client);
-            clients.insert(client);
-            // println!("all of them: {:?}", clients);
-            println!("Neighbors:");
-            for (idx, cl) in clients.iter().enumerate() {
-                println!("{idx}: {cl}");
+        loop {
+            'block: {
+                let Ok(client) = client_receiver.recv_timeout(Duration::from_millis(10)) else {
+                    break 'block;
+                };
+                //println!("found {}", client);
+                clients.insert(client);
+                // println!("all of them: {:?}", clients);
+                println!("Neighbors:");
+                for (idx, cl) in clients.iter().enumerate() {
+                    println!("{idx}: {cl}");
+                }
+                println!();
             }
-            println!();
+            'block: {
+                let Ok(input) = stdin_receiver
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_millis(10))
+                else {
+                    break 'block;
+                };
+                let input = input.trim(); // parse input
+                let Ok(num) = input.parse::<u64>() else {
+                    eprintln!("USER-ERROR: not a number: `{input}`");
+                    break 'block;
+                };
+                println!("found {}", num);
+                let Some(client) = clients.iter().skip(num as _).next() else {
+                    eprintln!("USER-ERROR: client `{}` does not exist", num);
+                    break 'block;
+                };
+                println!("Connecting to {}", client);
+                let Ok(tcp_stream) = TcpStream::connect_timeout(
+                    &SocketAddr::new(client.0, PORT),
+                    Duration::from_millis(1000),
+                ) else {
+                    eprintln!("ERROR: Could not connect to {}", client);
+                    break 'block;
+                };
+
+                talk_with_client(tcp_stream, &stdin_receiver)?;
+            }
         }
-        'block: {
-            let Ok(num) = stdin_reciever.recv_timeout(Duration::from_millis(10)) else {
-                break 'block;
-            };
-            println!("found {}", num);
-            let Some(client) = clients.iter().skip(num as _).next() else {
-                println!("USER-ERROR: client `{}` does not exist", num); 
-                break 'block;
-            };
-            println!("Connecting to {}", client);
-            let Ok(tcp_stream) = TcpStream::connect_timeout(&SocketAddr::new(client.0, PORT), Duration::from_millis(1000)) else {
-                println!("ERROR: Could not connect to {}", client);
-                break 'block;
-            };
-            
-            talk_with_client(tcp_stream)?;
-            loop {}
-        }
-    }
+    })?;
+    Ok(())
     //
     //     loop {}
     //
