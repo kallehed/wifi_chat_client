@@ -2,88 +2,95 @@ use std::hash::{BuildHasher, Hasher};
 use std::io::{Error, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 const PORT: u16 = 2000;
 
 // ms til next existance broadcast
-const REBROADCAST_TIME: u64 = 1000;
+const REBROADCAST_TIME: u64 = 1500;
 
 const NAME_SIZE: u64 = 32;
 
 #[derive(Hash, Eq, PartialEq, Debug)]
-struct Client(IpAddr, [u8; NAME_SIZE as _]);
+struct Peer(IpAddr, [u8; NAME_SIZE as _]);
 
-impl std::fmt::Display for Client {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Client(")?;
-        self.0.fmt(f)?;
-        write!(f, ", Name: ")?;
-        for a in self.1 {
-            write!(f, "{}", a as char)?;
-        }
-        write!(f, ")")?;
-        std::fmt::Result::Ok(())
-    }
-}
+fn main() -> Result<(), Error> {
+    println!("INSTRUCTIONS:\n when looking at neighbors, write a number to connect to them\n disconnect from peer by writing `exit` or `quit`");
+    println!("What is your name? : ");
+    let mut buf = [0; 256];
+    std::io::stdin().read(&mut buf)?;
+    let (peer_sender, peer_receiver) = mpsc::sync_channel(0);
+    let _listener = std::thread::spawn(move || {
+        listen_and_broadcast_existance(peer_sender, &buf).unwrap();
+    });
 
-fn listen_and_broadcast_existance(channel: SyncSender<Client>, name: &[u8]) -> Result<(), Error> {
-    loop {
-        // broadcast existance
-        {
-            let broadcaster = UdpSocket::bind(("0.0.0.0", PORT))?;
-            broadcaster.set_broadcast(true)?;
-            broadcaster.send_to(name, ("255.255.255.255", PORT))?;
-        }
-        // listen for other clients existance
+    let (stdin_sender, stdin_receiver) = mpsc::sync_channel(0);
+    let stdin_receiver = Mutex::new(stdin_receiver);
+    std::thread::scope(|s| -> Result<(), Error> {
+        let _stdin_listener = s.spawn(move || {
+            stdin_listener(stdin_sender).unwrap();
+        });
+
+        let _connection_listener = s.spawn(|| {
+            incoming_connection_listener(&stdin_receiver).unwrap();
+        });
+
+        let mut peers = std::collections::HashSet::new();
+
         loop {
-            let listen = UdpSocket::bind(("255.255.255.255", PORT))?;
-            let mut buf = [0; NAME_SIZE as _];
-            listen.set_read_timeout(Some(Duration::from_millis(REBROADCAST_TIME)))?;
-            let Ok((_size, sender)) = listen.recv_from(&mut buf) else {
-                break; // NO MESSAGE RECEIVED, now we shall broadcast again
-            };
-            channel // send to channel
-                .send(Client(sender.ip(), buf))
-                .map_err(|_| std::io::Error::last_os_error())?;
-            // found client
-            // std::io::stdout().write_all(&buf)?;
-            std::thread::sleep(Duration::from_millis(
-                std::collections::hash_map::RandomState::new()
-                    .build_hasher()
-                    .finish() as u64
-                    % 100,
-            ));
+            // print neighbors block
+            'block: {
+                let Ok(peer) = peer_receiver.recv_timeout(Duration::from_millis(10)) else {
+                    break 'block;
+                };
+                //println!("found {}", peer);
+                peers.insert(peer);
+                // println!("all of them: {:?}", peers);
+                println!("Neighbors:");
+                for (idx, cl) in peers.iter().enumerate() {
+                    println!("{idx}: {cl}");
+                }
+                println!();
+            }
+            // connect to other user block
+            'block: {
+                let Ok(input) = stdin_receiver
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_millis(10))
+                else {
+                    break 'block;
+                };
+                let input = input.trim(); // parse input
+                let Ok(num) = input.parse::<u64>() else {
+                    eprintln!("USER-ERROR: not a number: `{input}`");
+                    break 'block;
+                };
+                let Some(peer) = peers.iter().skip(num as _).next() else {
+                    eprintln!("USER-ERROR: peer `{}` does not exist", num);
+                    break 'block;
+                };
+                println!("Connecting to {}", peer);
+                let Ok(tcp_stream) = TcpStream::connect_timeout(
+                    &SocketAddr::new(peer.0, PORT),
+                    Duration::from_millis(1000),
+                ) else {
+                    eprintln!("ERROR: Could not connect to {}", peer);
+                    break 'block;
+                };
+
+                talk_with_peer(tcp_stream, &stdin_receiver)?;
+            }
         }
-    }
+    })?;
+    Ok(())
 }
 
-// listens on stdin and forwards it through channel
-fn stdin_listener(channel: SyncSender<String>) -> Result<(), Error> {
-    loop {
-        let mut buf = [0; 256];
-        println!("waiting for stdin");
-        let size = std::io::stdin().read(&mut buf)?;
-        println!("got stdin");
-
-        let Ok(str) = std::str::from_utf8(&buf[..size]) else {
-            continue;
-        };
-        channel.send(str.to_string()).unwrap();
-    }
-}
-
-fn incoming_connection_listener(stdin_receiver: &Mutex<Receiver<String>>) -> Result<(), Error> {
-    let listener = TcpListener::bind(("0.0.0.0", PORT))?;
-
-    loop {
-        let (stream, _address) = listener.accept()?;
-        talk_with_client(stream, stdin_receiver)?;
-    }
-}
-
-fn talk_with_client(
+/// read from stdin -> write to peer
+/// read from tcp_stream -> write to stdout
+/// take turns with each.
+fn talk_with_peer(
     mut stream: TcpStream,
     stdin_receiver: &Mutex<Receiver<String>>,
 ) -> Result<(), Error> {
@@ -106,7 +113,7 @@ fn talk_with_client(
                 break 'block;
             };
             if size == 0 {
-                // client has disconnected
+                // peer has disconnected
                 break 'main_loop;
             }
             print!("got: ");
@@ -117,69 +124,72 @@ fn talk_with_client(
     Ok(())
 }
 
-fn main() -> Result<(), Error> {
-    let (client_sender, client_receiver) = mpsc::sync_channel(0);
-    let _listener = std::thread::spawn(move || {
-        listen_and_broadcast_existance(client_sender, b"YOLOSwag").unwrap();
-    });
-
-    let (stdin_sender, stdin_receiver) = mpsc::sync_channel(0);
-    let stdin_receiver = Mutex::new(stdin_receiver);
-    std::thread::scope(|s| -> Result<(), Error> {
-        let _stdin_listener = s.spawn(move || {
-            stdin_listener(stdin_sender).unwrap();
-        });
-
-        let _connection_listener = s.spawn(|| {
-            incoming_connection_listener(&stdin_receiver).unwrap();
-        });
-
-        let mut clients = std::collections::HashSet::new();
-
-        loop {
-            'block: {
-                let Ok(client) = client_receiver.recv_timeout(Duration::from_millis(10)) else {
-                    break 'block;
-                };
-                //println!("found {}", client);
-                clients.insert(client);
-                // println!("all of them: {:?}", clients);
-                println!("Neighbors:");
-                for (idx, cl) in clients.iter().enumerate() {
-                    println!("{idx}: {cl}");
-                }
-                println!();
-            }
-            'block: {
-                let Ok(input) = stdin_receiver
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_millis(10))
-                else {
-                    break 'block;
-                };
-                let input = input.trim(); // parse input
-                let Ok(num) = input.parse::<u64>() else {
-                    eprintln!("USER-ERROR: not a number: `{input}`");
-                    break 'block;
-                };
-                println!("found {}", num);
-                let Some(client) = clients.iter().skip(num as _).next() else {
-                    eprintln!("USER-ERROR: client `{}` does not exist", num);
-                    break 'block;
-                };
-                println!("Connecting to {}", client);
-                let Ok(tcp_stream) = TcpStream::connect_timeout(
-                    &SocketAddr::new(client.0, PORT),
-                    Duration::from_millis(1000),
-                ) else {
-                    eprintln!("ERROR: Could not connect to {}", client);
-                    break 'block;
-                };
-
-                talk_with_client(tcp_stream, &stdin_receiver)?;
-            }
+/// take turns broadcasting existance through udp
+/// + reading from udp broadcast to see if anyone
+/// is here.
+/// Send found peers down a mpsc channel
+fn listen_and_broadcast_existance(channel: SyncSender<Peer>, name: &[u8]) -> Result<(), Error> {
+    loop {
+        // broadcast existance
+        {
+            let broadcaster = UdpSocket::bind(("0.0.0.0", PORT))?;
+            broadcaster.set_broadcast(true)?;
+            broadcaster.send_to(name, ("255.255.255.255", PORT))?;
         }
-    })?;
-    Ok(())
+        // listen for other peers existance
+        'block: {
+            let listen = UdpSocket::bind(("255.255.255.255", PORT))?;
+            let mut buf = [0; NAME_SIZE as _];
+            listen.set_read_timeout(Some(Duration::from_millis(
+                REBROADCAST_TIME
+                    + std::collections::hash_map::RandomState::new()
+                        .build_hasher()
+                        .finish() as u64
+                        % 200,
+            )))?;
+            let Ok((_size, sender)) = listen.recv_from(&mut buf) else {
+                break 'block; // NO MESSAGE RECEIVED, now we shall broadcast again
+            };
+            channel.send(Peer(sender.ip(), buf)).unwrap(); // send to channel
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+}
+
+/// listens on stdin and forwards it through mpsc channel
+fn stdin_listener(channel: SyncSender<String>) -> Result<(), Error> {
+    loop {
+        let mut buf = [0; 256];
+        let size = std::io::stdin().read(&mut buf)?;
+
+        let Ok(str) = std::str::from_utf8(&buf[..size]) else {
+            continue;
+        };
+        channel.send(str.to_string()).unwrap();
+    }
+}
+
+/// listens for anyone trying to connect to us through tcp
+/// subsequently we start a chat
+fn incoming_connection_listener(stdin_receiver: &Mutex<Receiver<String>>) -> Result<(), Error> {
+    let listener = TcpListener::bind(("0.0.0.0", PORT))?;
+
+    loop {
+        let (stream, _address) = listener.accept()?;
+        talk_with_peer(stream, stdin_receiver)?;
+    }
+}
+
+/// pretty print Peer
+impl std::fmt::Display for Peer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Peer(")?;
+        self.0.fmt(f)?;
+        write!(f, ", Name: ")?;
+        for a in self.1 {
+            write!(f, "{}", a as char)?;
+        }
+        write!(f, ")")?;
+        std::fmt::Result::Ok(())
+    }
 }
